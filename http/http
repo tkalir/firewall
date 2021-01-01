@@ -1,0 +1,84 @@
+#!/usr/bin/env python
+
+import select, socket, sys, queue
+from enum import Enum
+
+from io import BytesIO
+import time, re, os, signal, fcntl
+import ipaddress
+from http.client import HTTPResponse 
+from collections import deque
+import traceback
+from HTTPParser import HTTPParser
+sys.path.insert(0, '../proxy/')
+
+from NoBlockServer import *
+ 
+class HTTP_Server_reader(queue_worker):
+    def __init__(self, sock, to_client):      
+        super().__init__(sock, to_client)
+        self.preprocessed = deque()
+        self.parser = HTTPParser(self.preprocessed, to_client)
+
+def read_from_server(reader, mask):
+    while True:
+        try:
+            data = reader.sock.recv(1024)
+            if data:
+                reader.preprocessed.append(data)
+                while reader.preprocessed:
+                    if reader.parser.process() == 1:
+                        reader.parser.reset()
+            else:
+                reader.connection.close_server()
+                return
+        except:
+            return 
+
+###################################################
+        
+def accept(proxy, mask):
+    client_soc, client_address = proxy.sock.accept()
+    port = client_address[1]
+    try:
+        ioctl_res = fcntl.ioctl(proxy.proxy_dev, 42, socket.htons(port))
+    except Exception as e:
+        print(port, flush=True)
+        print (e, flush=True)
+        client_soc.close()
+        return
+    server_ip = str(ipaddress.IPv4Address(socket.ntohl(ioctl_res)))
+    server_soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_soc.bind(('', port))
+    server_soc.connect((server_ip, 80))
+    client_soc.setblocking(0)
+    server_soc.setblocking(0)
+    client_2_serv = deque()
+    serv_2_client = deque()
+
+    connection = Connection(client_soc, server_soc)
+
+    c_reader = Client_reader(client_soc, client_2_serv)    
+    s_writer = Server_writer(server_soc, client_2_serv)
+    s_reader = HTTP_Server_reader(server_soc, serv_2_client)
+    c_writer = Client_writer(client_soc, serv_2_client)
+    c_writer.connection = connection
+    c_reader.connection = connection
+    s_writer.connection = connection
+    s_reader.connection = connection
+
+    client_dispatcher = Dispatcher(client_soc, c_reader, c_writer)
+    server_dispatcher= Dispatcher(server_soc, s_reader, s_writer)
+
+    mask = selectors.EVENT_READ | selectors.EVENT_WRITE
+    proxy.sel.register(client_dispatcher, mask, disptach_client)
+    proxy.sel.register(server_dispatcher, mask, disptach_server)
+
+
+def main():
+    sock = create_sock(800, 1024)
+    with open("/dev/proxy", "r") as proxy_dev:
+        proxy = Proxy(proxy_dev, sock, accept)
+        proxy.run_forever()
+        
+main()

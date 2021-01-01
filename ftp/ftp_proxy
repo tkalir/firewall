@@ -1,0 +1,136 @@
+#!/usr/bin/env python
+
+import select, socket, sys, queue
+from enum import Enum
+
+from io import BytesIO
+import sys, time, re, os, signal, fcntl
+import ipaddress
+from collections import deque
+import selectors
+import traceback
+import array
+sys.path.insert(0, '../proxy/')
+
+from NoBlockServer import *
+
+class Mapping:
+    def __init__(self):
+        self.map = {}
+        
+    def add_client(self, fd, client_ip, client_port):
+        val = (client_ip, client_port)
+        self.map.update({fd: val})
+
+    def get_port(self, fd, ip):
+        val = self.map[fd]
+        if val[0] == ip:
+            return val[1]
+        else:
+            return None
+
+def analyze_PORT(port_cmd):
+    port_args = port_cmd.split(",", 5)
+    ip_args = port_args[0:4]
+    ports = port_args[4:]
+    ip = ".".join(ip_args)
+    new_port = int(ports[0]) * 256 + int(ports[1])
+    return (ip, new_port)
+
+     
+def read_from_client(reader, mask):
+    sock = reader.sock
+    while True:
+        try:    
+            data = sock.recv(1024)
+            if data:
+                text = data.decode('utf-8')
+                port_cmd_ind = text.find("PORT ")
+                if port_cmd_ind != -1:
+                    try:
+                        proxy = reader.proxy
+                        res = analyze_PORT(text[port_cmd_ind + 5:])
+                        ftp_port = res[1]
+                        client_port = proxy.map.get_port(sock, res[0])
+                        ioctl_arg1 = socket.htons(client_port)
+                        ioctl_arg2 = socket.htons(ftp_port)
+                        p = proxy.proxy_dev
+                        fcntl.ioctl(p, 45, ioctl_arg1)               
+                        fcntl.ioctl(proxy.proxy_dev, 44, ioctl_arg2)
+                    except ValueError as e: #illegal PORT command
+                        print(e)
+                reader.deque.append(data)
+                
+            else: #client closed
+                reader.connection.close_client()        
+                return
+        except Exception as e:
+            print(e)
+            return
+
+def read_from_server(reader, mask):
+    while True:
+        try:
+            data = reader.sock.recv(1024)
+            if data:
+                reader.deque.append(data)
+            else:
+                reader.connection.close_server()
+                return
+        except Exception as e:
+            print(e)
+            return
+
+def accept(proxy, mask):
+    try:
+        client_soc, client_address = proxy.sock.accept()
+    except Exception:
+        return
+    port = client_address[1]
+    ip = client_address[0]
+    print(client_address[0]) #ip
+    print(client_address[1]) #port
+
+    proxy.map.add_client(client_soc, ip, port)
+    ioctl_res = fcntl.ioctl(proxy.proxy_dev, 43, socket.htons(port))
+    server_ip = str(ipaddress.IPv4Address(socket.ntohl(ioctl_res)))
+
+    server_soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_soc.bind(('', port))
+    try:
+        server_soc.connect((server_ip, 21))
+    except Exception:
+        client_soc.close()
+        return
+    client_soc.setblocking(0)
+    server_soc.setblocking(0)
+    client_2_serv = deque()
+    serv_2_client = deque()
+
+    connection = Connection(client_soc, server_soc)
+
+    c_reader = Client_reader(client_soc, client_2_serv)    
+    s_writer = Server_writer(server_soc, client_2_serv)
+    s_reader = Server_reader(server_soc, serv_2_client)
+    c_writer = Client_writer(client_soc, serv_2_client)
+    c_writer.connection = connection
+    c_reader.connection = connection
+    s_writer.connection = connection
+    s_reader.connection = connection
+
+    client_dispatcher = Dispatcher(client_soc, c_reader, c_writer)
+    server_dispatcher= Dispatcher(server_soc, s_reader, s_writer)
+
+    mask = selectors.EVENT_READ | selectors.EVENT_WRITE
+    proxy.sel.register(client_dispatcher, mask, disptach_client)
+    proxy.sel.register(server_dispatcher, mask, disptach_server)
+    c_reader.proxy = proxy
+
+def main():
+    sock = create_sock(210, 1024)
+    with open("/dev/proxy", "r") as proxy_dev:
+        proxy = Proxy(proxy_dev, sock, accept)
+        proxy.map = Mapping()
+        proxy.run_forever()
+
+main()
